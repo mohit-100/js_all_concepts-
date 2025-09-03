@@ -1,0 +1,699 @@
+Love it — you nailed the theory. I’ve dropped a complete **Node/TypeScript “system-design-to-code” cookbook** in the canvas with copy-pasteable snippets:
+
+* API Gateway (Express + proxy)
+* Auth/Order/Payment microservices with health checks
+* Nginx load balancer (round-robin across replicas)
+* Async workers with Redis + BullMQ
+* Pub/Sub with Redis
+* Redis caching middleware
+* Token-bucket rate limiter (Redis)
+* DB primary + read-replica pattern (Postgres)
+* CDN-friendly cache headers
+* Circuit breaker wrapper
+* Dockerfiles + docker-compose
+* Kubernetes Deployments, Service, HPA, Ingress
+* Basic observability (latency logging)
+
+If you tell me which piece you want to run first (e.g., **Gateway + Order service with Nginx** or **Payments + Email worker**), I’ll trim it into a tiny runnable repo layout for you in one shot.
+
+# System Design to Code – Node/TypeScript Cookbook
+
+A practical, copy‑pasteable set of examples in **Node.js + TypeScript** that map common system design concepts (load balancers, API gateway, microservices, queues, pub/sub, caching, rate limits, replicas, CDNs, health checks, containers, autoscaling) to working code/config.
+
+> You can use these snippets independently. Each section is self-contained and minimal on dependencies.
+
+---
+
+## 0) Minimal Monorepo Structure (suggested)
+
+```
+.
+├─ gateway/                 # API Gateway (Express)
+├─ services/
+│  ├─ auth-service/
+│  ├─ order-service/
+│  └─ payment-service/
+├─ workers/
+│  └─ email-worker/
+├─ shared/
+│  └─ libs/                 # shared types/utils
+├─ infra/
+│  ├─ nginx/                # Nginx LB config
+│  ├─ docker/               # Dockerfiles & docker-compose
+│  └─ k8s/                  # Kubernetes manifests
+└─ package.json
+```
+
+---
+
+## 1) API Gateway (Express + TypeScript)
+
+**Purpose:** Single entry point; routes to microservices; good place for auth, rate limits, request logging.
+
+**`gateway/src/index.ts`**
+
+```ts
+import express from 'express';
+import morgan from 'morgan';
+import httpProxy from 'http-proxy-middleware';
+import helmet from 'helmet';
+
+const app = express();
+app.use(helmet());
+app.use(express.json());
+app.use(morgan('dev'));
+
+// Simple service discovery via env (could be Consul/Eureka/etc.)
+const AUTH_URL = process.env.AUTH_URL || 'http://localhost:4001';
+const ORDER_URL = process.env.ORDER_URL || 'http://localhost:4002';
+const PAYMENT_URL = process.env.PAYMENT_URL || 'http://localhost:4003';
+
+// Pass-through proxies by path prefix
+app.use('/auth', httpProxy.createProxyMiddleware({ target: AUTH_URL, changeOrigin: true }));
+app.use('/orders', httpProxy.createProxyMiddleware({ target: ORDER_URL, changeOrigin: true }));
+app.use('/payments', httpProxy.createProxyMiddleware({ target: PAYMENT_URL, changeOrigin: true }));
+
+app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+const port = process.env.PORT || 4000;
+app.listen(port, () => console.log(`Gateway on :${port}`));
+```
+
+**Install:** `npm i express morgan helmet http-proxy-middleware`
+
+---
+
+## 2) Microservices (Express + TS) with Health Checks
+
+**`services/auth-service/src/index.ts`**
+
+```ts
+import express from 'express';
+const app = express();
+app.use(express.json());
+
+app.post('/login', (req, res) => {
+  const { email } = req.body;
+  // pretend auth
+  res.json({ token: `jwt-${email}` });
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.listen(4001, () => console.log('auth-service :4001'));
+```
+
+**`services/order-service/src/index.ts`**
+
+```ts
+import express from 'express';
+const app = express();
+app.use(express.json());
+
+app.post('/', (req, res) => {
+  // create order
+  res.status(201).json({ id: Math.random().toString(36).slice(2), status: 'PLACED' });
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.listen(4002, () => console.log('order-service :4002'));
+```
+
+**`services/payment-service/src/index.ts`**
+
+```ts
+import express from 'express';
+const app = express();
+app.use(express.json());
+
+app.post('/', (req, res) => {
+  // pretend to charge
+  res.json({ chargeId: Date.now().toString(), status: 'PAID' });
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.listen(4003, () => console.log('payment-service :4003'));
+```
+
+---
+
+## 3) Load Balancer (Nginx) – Round Robin across replicas
+
+**`infra/nginx/nginx.conf`**
+
+```nginx
+worker_processes auto;
+events { worker_connections 1024; }
+http {
+  upstream order_backends {
+    server order-svc-1:4002;
+    server order-svc-2:4002;
+  }
+
+  server {
+    listen 80;
+
+    # LB for /orders -> two replicas
+    location /orders {
+      proxy_pass http://order_backends;
+    }
+
+    # Gateway pass-through for others
+    location /auth { proxy_pass http://gateway:4000; }
+    location /payments { proxy_pass http://gateway:4000; }
+    location /health { proxy_pass http://gateway:4000; }
+  }
+}
+```
+
+> Spin multiple container instances (e.g., `order-svc-1`, `order-svc-2`). Nginx will round-robin requests.
+
+---
+
+## 4) Asynchronous Processing with Queues (Redis + BullMQ)
+
+**Producer (e.g., create job after payment)**
+
+```ts
+// services/payment-service/src/queue.ts
+import { Queue } from 'bullmq';
+const q = new Queue('email', { connection: { host: 'redis', port: 6379 } });
+export async function enqueueReceipt(email: string, orderId: string) {
+  await q.add('send-receipt', { email, orderId });
+}
+```
+
+**Worker**
+
+```ts
+// workers/email-worker/src/index.ts
+import { Worker, QueueScheduler } from 'bullmq';
+
+new QueueScheduler('email', { connection: { host: 'redis', port: 6379 } });
+
+const worker = new Worker('email', async job => {
+  if (job.name === 'send-receipt') {
+    const { email, orderId } = job.data;
+    // send email here
+    console.log('📧 sending receipt to', email, 'for order', orderId);
+  }
+}, { connection: { host: 'redis', port: 6379 } });
+
+worker.on('failed', (job, err) => console.error('DLQ candidate:', job?.id, err));
+```
+
+**Usage in payment route**
+
+```ts
+// services/payment-service/src/index.ts (fragment)
+import { enqueueReceipt } from './queue';
+app.post('/', async (req, res) => {
+  const { email, orderId } = req.body;
+  await enqueueReceipt(email, orderId);
+  res.json({ status: 'PAID', enqueued: true });
+});
+```
+
+---
+
+## 5) Pub/Sub (Redis)
+
+**Publisher**
+
+```ts
+// services/payment-service/src/pub.ts
+import { createClient } from 'redis';
+const pub = createClient({ url: 'redis://redis:6379' });
+await pub.connect();
+export async function publishPayment(event: any) {
+  await pub.publish('payments', JSON.stringify(event));
+}
+```
+
+**Subscriber(s)**
+
+```ts
+// services/notification-service/src/sub.ts
+import { createClient } from 'redis';
+const sub = createClient({ url: 'redis://redis:6379' });
+await sub.connect();
+await sub.subscribe('payments', (msg) => {
+  const evt = JSON.parse(msg);
+  console.log('payment event received by notifications:', evt);
+});
+```
+
+> Multiple services can subscribe to `payments` and react independently.
+
+---
+
+## 6) Caching with Redis (per-route cache middleware)
+
+```ts
+// gateway/src/cache.ts
+import type { Request, Response, NextFunction } from 'express';
+import { createClient } from 'redis';
+
+const client = createClient({ url: 'redis://redis:6379' });
+client.connect();
+
+export function cache(ttlSec: number) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const key = `cache:${req.method}:${req.originalUrl}`;
+    const cached = await client.get(key);
+    if (cached) return res.set('X-Cache', 'HIT').type('json').send(cached);
+
+    const send = res.send.bind(res);
+    res.send = (body: any) => {
+      // store stringified body
+      client.setEx(key, ttlSec, typeof body === 'string' ? body : JSON.stringify(body)).catch(()=>{});
+      res.set('X-Cache', 'MISS');
+      return send(body);
+    } as any;
+    next();
+  };
+}
+```
+
+**Use it**
+
+```ts
+// gateway/src/index.ts (fragment)
+import { cache } from './cache';
+app.use('/products', cache(30)); // cache product list for 30s
+```
+
+---
+
+## 7) Rate Limiting (Token Bucket in Redis)
+
+```ts
+// gateway/src/rateLimit.ts
+import type { Request, Response, NextFunction } from 'express';
+import { createClient } from 'redis';
+
+const r = createClient({ url: 'redis://redis:6379' });
+r.connect();
+
+interface Options { capacity: number; refillPerSec: number; }
+export function tokenBucket({ capacity, refillPerSec }: Options) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const id = req.ip; // or API key
+    const key = `tb:${id}`;
+
+    const now = Date.now();
+    const state = await r.hGetAll(key);
+
+    let tokens = Number(state.tokens ?? capacity);
+    let last = Number(state.last ?? now);
+
+    const elapsedSec = (now - last) / 1000;
+    tokens = Math.min(capacity, tokens + elapsedSec * refillPerSec);
+
+    if (tokens < 1) {
+      const retry = Math.ceil((1 - tokens) / refillPerSec);
+      res.set('Retry-After', String(retry));
+      return res.status(429).json({ error: 'rate_limited' });
+    }
+
+    tokens -= 1;
+    await r.hSet(key, { tokens: tokens.toFixed(4), last: String(now) });
+    await r.expire(key, 3600);
+    next();
+  };
+}
+```
+
+**Use it**
+
+```ts
+// gateway/src/index.ts (fragment)
+import { tokenBucket } from './rateLimit';
+app.use(tokenBucket({ capacity: 20, refillPerSec: 5 }));
+```
+
+---
+
+## 8) Database: Primary + Read Replicas (PostgreSQL example)
+
+```ts
+// services/order-service/src/db.ts
+import { Pool } from 'pg';
+
+export const writer = new Pool({
+  connectionString: process.env.PG_PRIMARY, // e.g. postgres://user:pass@pg-primary:5432/app
+});
+
+export const reader = new Pool({
+  connectionString: process.env.PG_REPLICA, // e.g. postgres://user:pass@pg-replica:5432/app
+});
+```
+
+**Usage pattern**
+
+```ts
+// write path
+await writer.query('INSERT INTO orders(id, user_id, total) VALUES($1,$2,$3)', [id, uid, total]);
+
+// read path
+const { rows } = await reader.query('SELECT * FROM orders WHERE user_id = $1 LIMIT 20', [uid]);
+```
+
+> Keep writes on the primary; send reads to replicas. For eventual consistency, add `ORDER BY created_at` and tolerate slight replication lag.
+
+---
+
+## 9) CDN + Caching Headers (Express static)
+
+```ts
+// gateway/src/static.ts
+import express from 'express';
+import path from 'path';
+
+export function mountStatic(app: express.Express) {
+  const assets = path.join(process.cwd(), 'public');
+  app.use('/static', express.static(assets, {
+    setHeaders(res, filePath) {
+      if (filePath.endsWith('.jpg') || filePath.endsWith('.png') || filePath.endsWith('.css') || filePath.endsWith('.js')) {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      } else {
+        res.setHeader('Cache-Control', 'public, max-age=60');
+      }
+    }
+  }));
+}
+```
+
+> Put a CDN (e.g., CloudFront/Cloudflare) in front of `/static`. The headers help the CDN cache assets near users.
+
+---
+
+## 10) Health Checks + Readiness/Liveness
+
+```ts
+// common pattern in each service
+app.get('/health/live', (_req, res) => res.sendStatus(200)); // process alive
+app.get('/health/ready', async (_req, res) => {
+  try {
+    await importantDependency.ping();
+    res.sendStatus(200);
+  } catch {
+    res.sendStatus(503);
+  }
+});
+```
+
+---
+
+## 11) Circuit Breaker (wrap unstable downstream calls)
+
+```ts
+// gateway/src/circuit.ts
+import axios from 'axios';
+
+type State = 'CLOSED' | 'OPEN' | 'HALF';
+let state: State = 'CLOSED';
+let failures = 0;
+let openedAt = 0;
+
+const THRESHOLD = 5;       // failures before OPEN
+const COOLDOWN_MS = 10000; // try again after 10s
+
+export async function callOrders(url: string) {
+  if (state === 'OPEN' && Date.now() - openedAt < COOLDOWN_MS) {
+    throw new Error('circuit_open');
+  }
+  try {
+    const res = await axios.get(url, { timeout: 2000 });
+    failures = 0; state = 'CLOSED';
+    return res.data;
+  } catch (e) {
+    failures++;
+    if (failures >= THRESHOLD) { state = 'OPEN'; openedAt = Date.now(); }
+    throw e;
+  }
+}
+```
+
+---
+
+## 12) Dockerfiles (multi-stage) + Redis/Postgres
+
+**`infra/docker/Dockerfile.service`**
+
+```dockerfile
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+ENV NODE_ENV=production
+CMD ["node","dist/index.js"]
+```
+
+**`infra/docker/docker-compose.yml`** (dev-friendly)
+
+```yaml
+version: '3.9'
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  pg-primary:
+    image: bitnami/postgresql:16
+    environment:
+      - POSTGRESQL_DATABASE=app
+      - POSTGRESQL_USERNAME=user
+      - POSTGRESQL_PASSWORD=pass
+    ports: ["5432:5432"]
+
+  gateway:
+    build:
+      context: ../../gateway
+      dockerfile: ../infra/docker/Dockerfile.service
+    environment:
+      - AUTH_URL=http://auth:4001
+      - ORDER_URL=http://order:4002
+      - PAYMENT_URL=http://payment:4003
+    ports: ["4000:4000"]
+    depends_on: [auth, order, payment]
+
+  auth:
+    build: { context: ../../services/auth-service, dockerfile: ../infra/docker/Dockerfile.service }
+    ports: ["4001:4001"]
+
+  order:
+    build: { context: ../../services/order-service, dockerfile: ../infra/docker/Dockerfile.service }
+    ports: ["4002:4002"]
+
+  payment:
+    build: { context: ../../services/payment-service, dockerfile: ../infra/docker/Dockerfile.service }
+    ports: ["4003:4003"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:80"]
+    depends_on: [gateway]
+```
+
+> Dev tip: run `docker compose up --build` from `infra/docker/`.
+
+---
+
+## 13) Kubernetes (Deployments, Service, HPA, Ingress)
+
+**`infra/k8s/order-deployment.yaml`**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: order }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: order } }
+  template:
+    metadata: { labels: { app: order } }
+    spec:
+      containers:
+        - name: order
+          image: yourrepo/order:latest
+          ports: [{ containerPort: 4002 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 4002 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 4002 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata: { name: order }
+spec:
+  selector: { app: order }
+  ports: [{ port: 4002, targetPort: 4002 }]
+```
+
+**HPA**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: order-hpa }
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+**Ingress (as API gateway/L7 LB)**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /orders
+            pathType: Prefix
+            backend:
+              service:
+                name: order
+                port: { number: 4002 }
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth
+                port: { number: 4001 }
+```
+
+---
+
+## 14) Observability (basic)
+
+**Request logging + latency header**
+
+```ts
+// gateway/src/obs.ts
+import type { Request, Response, NextFunction } from 'express';
+export function latency() {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const t0 = process.hrtime.bigint();
+    res.on('finish', () => {
+      const ms = Number((process.hrtime.bigint() - t0) / 1000000n);
+      res.setHeader('X-Response-Time', `${ms}ms`);
+      console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} ${ms}ms`);
+    });
+    next();
+  };
+}
+```
+
+**Use it**
+
+```ts
+// gateway/src/index.ts (fragment)
+import { latency } from './obs';
+app.use(latency());
+```
+
+---
+
+## 15) End-to-End Flow (Putting it together)
+
+1. Client hits `POST /payments` at **Gateway**.
+2. Gateway forwards to **payment-service**.
+3. Payment-service responds quickly and enqueues an email job via **BullMQ** (Queue) and publishes a `payments` event via **Redis Pub/Sub**.
+4. **Email worker** consumes the queue and sends the receipt.
+5. Other services (e.g., **notifications**) subscribe to the `payments` channel and act independently.
+6. Frequently-read endpoints (e.g., `/products`) are cached by the **Redis cache middleware**.
+7. **Nginx** load-balances traffic across **order-service** replicas.
+8. **HPA** in **Kubernetes** scales replicas based on CPU.
+9. **Circuit breaker** in gateway prevents cascading failures when `order-service` is unhealthy.
+
+---
+
+## 16) Quick Scripts
+
+**TypeScript tsconfig minimal**
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "strict": true
+  }
+}
+```
+
+**package.json scripts**
+
+```json
+{
+  "scripts": {
+    "dev": "ts-node-dev --respawn src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "express": "^4",
+    "http-proxy-middleware": "^3",
+    "ioredis": "^5",
+    "bullmq": "^5",
+    "pg": "^8",
+    "axios": "^1",
+    "helmet": "^7",
+    "morgan": "^1"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2",
+    "typescript": "^5"
+  }
+}
+```
+
+---
+
+### What to try next
+
+* Replace Redis Pub/Sub with Kafka (for persistence and replay).
+* Add JWT auth in the gateway and per-service RBAC.
+* Use a service mesh (Linkerd/Istio) for mTLS, retries, and better traffic policy.
+* Export metrics to Prometheus + Grafana; logs to Loki/ELK.
+* Blue/Green or Canary deploys via Argo Rollouts.
+
+---
+
+**Done.** You now have end‑to‑end, minimal code/configs that mirror the theory: scaling, LB, microservices, queues, pub/sub, caching, rate limits, replicas, CDN headers, health, containers, and k8s autoscaling.
